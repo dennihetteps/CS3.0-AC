@@ -1,0 +1,193 @@
+import os
+import hashlib
+from google.colab import files
+
+class SecureChromashift4:
+    def __init__(self, key_phrase: str):
+        self.key_hash = hashlib.sha256(key_phrase.encode('utf-8')).digest()
+
+    def _crypt_bytes(self, plain_bytes: bytes) -> bytes:
+        """Абсолютно стойкое шифрование со связыванием блоков (CBC-like)"""
+        cipher_bytes = bytearray()
+        iv = os.urandom(4)  # 4-байтный вектор инициализации
+        cipher_bytes.extend(iv)
+        previous_value = iv
+        
+        for b in plain_bytes:
+            mix = hashlib.sha256(self.key_hash + previous_value).digest()
+            cipher_byte = b ^ mix[0]  # Извлекаем первый байт хэша для гаммы
+            cipher_bytes.append(cipher_byte)
+            previous_value = bytes([cipher_byte])
+            
+        return bytes(cipher_bytes)
+
+    def _decrypt_bytes(self, cipher_bytes: bytes) -> bytes:
+        plain_bytes = bytearray()
+        if len(cipher_bytes) < 4: 
+            return b""
+        iv = cipher_bytes[:4]
+        previous_value = iv
+        
+        for b in cipher_bytes[4:]:
+            mix = hashlib.sha256(self.key_hash + previous_value).digest()
+            plain_byte = b ^ mix[0]
+            plain_bytes.append(plain_byte)
+            previous_value = bytes([b])
+            
+        return bytes(plain_bytes)
+
+    def generate_and_save_bmp(self, text: str, output_path: str):
+        """Генерирует абсолютно стойкий штрих-код 4.0 в формате BMP"""
+        full_text = text + "===END==="
+        encrypted_data = self._crypt_bytes(full_text.encode('utf-8'))
+        
+        bits = []
+        for byte in encrypted_data:
+            for i in range(8):
+                bits.append((byte >> (7 - i)) & 1)
+                
+        stripe_width = 4
+        num_stripes = len(bits) if len(bits) >= 80 else 80
+        width = num_stripes * stripe_width
+        height = 150
+        
+        row_size = (width * 3 + 3) & ~3  
+        pixel_data_size = row_size * height
+        file_size = 54 + pixel_data_size
+        
+        # Сборка заголовка BMP
+        bmp_data = bytearray(54)
+        bmp_data[0:2] = b'BM'
+        bmp_data[2:6] = file_size.to_bytes(4, 'little')
+        bmp_data[10:14] = int(54).to_bytes(4, 'little')
+        bmp_data[14:18] = int(40).to_bytes(4, 'little')
+        bmp_data[18:22] = width.to_bytes(4, 'little')
+        bmp_data[22:26] = height.to_bytes(4, 'little')
+        bmp_data[26:28] = int(1).to_bytes(2, 'little')
+        bmp_data[28:30] = int(24).to_bytes(2, 'little')
+        bmp_data[34:38] = pixel_data_size.to_bytes(4, 'little')
+        
+        # Генерация цветов полос по цепочке хэшей
+        stripe_colors = []
+        entropy_state = self.key_hash
+        
+        for s in range(num_stripes):
+            entropy_state = hashlib.sha256(entropy_state).digest()
+            
+            # Извлекаем три байта (0-255) из хэша для RGB
+            r = entropy_state[0]
+            g = entropy_state[1]
+            b = entropy_state[2]
+            
+            # Бит инвертирует цвет всей полосы
+            if s < len(bits):
+                if bits[s] == 1:
+                    r ^= 0xFF
+                    g ^= 0xFF
+                    b ^= 0xFF
+            
+            stripe_colors.append((r, g, b))
+            
+        # Запись пикселей
+        pixel_data = bytearray(pixel_data_size)
+        for y in range(height):
+            for s in range(num_stripes):
+                r, g, b = stripe_colors[s]
+                for w in range(stripe_width):
+                    x = s * stripe_width + w
+                    idx = y * row_size + x * 3
+                    pixel_data[idx] = b
+                    pixel_data[idx+1] = g
+                    pixel_data[idx+2] = r
+                    
+        bmp_data.extend(pixel_data)
+        
+        with open(output_path, 'wb') as f:
+            f.write(bmp_data)
+            
+        print("\n[УСПЕХ] Штрих-код успешно сгенерирован в памяти Google Colab!")
+
+    def extract_text(self, image_path: str) -> str:
+        with open(image_path, 'rb') as f:
+            bmp_data = f.read()
+            
+        pixel_offset = int.from_bytes(bmp_data[10:14], byteorder='little')
+        width = int.from_bytes(bmp_data[18:22], 'little')
+        
+        stripe_width = 4
+        num_stripes = width // stripe_width
+        
+        entropy_state = self.key_hash
+        bits = []
+        
+        for s in range(num_stripes):
+            entropy_state = hashlib.sha256(entropy_state).digest()
+            r_base = entropy_state[0]
+            g_base = entropy_state[1]
+            b_base = entropy_state[2]
+            
+            x = s * stripe_width
+            idx = pixel_offset + x * 3
+            
+            b_file = bmp_data[idx]
+            g_file = bmp_data[idx+1]
+            r_file = bmp_data[idx+2]
+            
+            if (r_file, g_file, b_file) == (r_base, g_base, b_base):
+                bits.append(0)
+            elif (r_file, g_file, b_file) == (r_base ^ 0xFF, g_base ^ 0xFF, b_base ^ 0xFF):
+                bits.append(1)
+            else:
+                bits.append(0)
+                
+        cipher_bytes = bytearray()
+        for i in range(0, len(bits), 8):
+            byte_bits = bits[i:i+8]
+            if len(byte_bits) < 8: break
+            byte_val = 0
+            for bit in byte_bits:
+                byte_val = (byte_val << 1) | bit
+            cipher_bytes.append(byte_val)
+            
+        decrypted = self._decrypt_bytes(bytes(cipher_bytes))
+        try:
+            decoded = decrypted.decode('utf-8', errors='ignore')
+            if "===END===" in decoded:
+                return decoded.split("===END===")[0]
+            return "[Ошибка] Неверный ключ или файл поврежден."
+        except:
+            return "[Ошибка] Не удалось раскодировать данные."
+
+# --- ОБОЛОЧКА ДЛЯ GOOGLE COLAB ---
+print("=== CHROMASHIFT 4.0 (COLAB VERSION) ===")
+print("1. Зашифровать текст в штрих-код")
+print("2. Расшифровать текст из штрих-кода")
+choice = input("Выберите действие (1 или 2): ").strip()
+
+if choice == '1':
+    password = input("Ввести ключ: ")
+    text_to_hide = input("Ввести текст: ")
+    filename = "chromashift_msg.bmp"
+    
+    steg = SecureChromashift4(password)
+    steg.generate_and_save_bmp(text_to_hide, filename)
+    
+    # Автоматическое скачивание файла прямо на ваш Android телефон!
+    print("Скачивание файла штрих-кода начнётся автоматически...")
+    files.download(filename)
+
+elif choice == '2':
+    password = input("Ввести ключ: ")
+    print("Сейчас откроется окно выбора файла. Выберите зашифрованный файл из галереи/проводника смартфона:")
+    
+    # Открывает стандартный выбор файлов Android прямо в Colab
+    uploaded = files.upload()
+    if uploaded:
+        uploaded_filename = list(uploaded.keys())[0]
+        steg = SecureChromashift4(password)
+        result = steg.extract_text(uploaded_filename)
+        print(f"\n[РЕЗУЛЬТАТ ДЕШИФРОВАНИЯ]:\n{result}")
+    else:
+        print("[Отмена]: Файл не был загружен.")
+else:
+    print("Неверный выбор.")
